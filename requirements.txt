@@ -1,0 +1,8 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+SQLAlchemy==2.0.40
+psycopg2-binary==2.9.10
+pydantic-settings==2.8.1
+Jinja2==3.1.6
+httpx==0.28.1
+
