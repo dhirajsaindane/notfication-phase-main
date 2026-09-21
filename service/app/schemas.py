@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class RecipientInput(BaseModel):
-    type: Literal["EMAIL", "USER"]
+    type: Literal["EMAIL", "USER", "PHONE"]
     value: str = Field(min_length=1, max_length=320)
 
 
@@ -56,6 +56,12 @@ class TemplateInput(BaseModel):
     subject: str = Field(min_length=1, max_length=255)
     body: str = Field(min_length=1)
     html_body: str | None = None
+    sms_body: str | None = Field(default=None, max_length=1600)
+
+
+class ApplicationConfigInput(BaseModel):
+    email_enabled: bool = True
+    sms_enabled: bool = False
 
 
 class RecipientDirectoryInput(BaseModel):

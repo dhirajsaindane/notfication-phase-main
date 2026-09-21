@@ -5,14 +5,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .config import settings
 from .database import Base, engine, get_session
-from .models import Delivery, Notification, Recipient, Template
+from .models import Application, Delivery, Notification, Recipient, Template
 from .schemas import (NotificationRequest, NotificationResponse, NotificationStatusResponse,
-                      RecipientDirectoryInput, TemplateInput)
+                      ApplicationConfigInput, RecipientDirectoryInput, TemplateInput)
 
 DEFAULT_TEMPLATES = {
-    "REPORT_READY": ("Your report {{ report_name }} is ready", "Hello,\n\nYour report '{{ report_name }}' is ready.", "<h1>Report ready</h1><p>Your report <strong>{{ report_name }}</strong> is ready.</p>"),
-    "PAYMENT_FAILED": ("Payment {{ payment_id }} failed", "Hello,\n\nPayment {{ payment_id }} for {{ amount }} could not be processed.", "<h1>Payment failed</h1><p>Payment <strong>{{ payment_id }}</strong> for <strong>{{ amount }}</strong> could not be processed.</p>"),
+    "REPORT_READY": ("Your report {{ report_name }} is ready", "Hello,\n\nYour report '{{ report_name }}' is ready.", "<h1>Report ready</h1><p>Your report <strong>{{ report_name }}</strong> is ready.</p>", "Report {{ report_name }} is ready."),
+    "PAYMENT_FAILED": ("Payment {{ payment_id }} failed", "Hello,\n\nPayment {{ payment_id }} for {{ amount }} could not be processed.", "<h1>Payment failed</h1><p>Payment <strong>{{ payment_id }}</strong> for <strong>{{ amount }}</strong> could not be processed.</p>", "Payment {{ payment_id }} for {{ amount }} failed. {{ reason }}"),
 }
 
 
@@ -20,9 +21,9 @@ DEFAULT_TEMPLATES = {
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     with Session(engine) as session:
-        for event, (subject, body, html_body) in DEFAULT_TEMPLATES.items():
+        for event, (subject, body, html_body, sms_body) in DEFAULT_TEMPLATES.items():
             if session.get(Template, event) is None:
-                session.add(Template(event=event, subject=subject, body=body, html_body=html_body))
+                session.add(Template(event=event, subject=subject, body=body, html_body=html_body, sms_body=sms_body))
         session.commit()
     yield
 
@@ -30,13 +31,17 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Notification Platform — Phase 1", version="1.0.0", lifespan=lifespan)
 
 
-def resolve_email(session: Session, recipient_type: str, recipient_value: str) -> str:
+def resolve_destination(session: Session, recipient_type: str, recipient_value: str) -> tuple[str, str]:
     if recipient_type == "EMAIL":
-        return recipient_value
+        return "EMAIL", recipient_value
+    if recipient_type == "PHONE":
+        if not recipient_value.startswith("+") or not recipient_value[1:].isdigit():
+            raise HTTPException(422, "PHONE recipients must use E.164 format, e.g. +919876543210")
+        return "SMS", recipient_value
     user = session.get(Recipient, recipient_value)
     if not user:
         raise HTTPException(422, f"Unknown USER recipient: {recipient_value}. Register it with POST /recipients first.")
-    return user.email
+    return "EMAIL", user.email
 
 
 @app.get("/health")
@@ -55,11 +60,24 @@ def create_notification(request: NotificationRequest, session: Session = Depends
 
     if not session.get(Template, request.event):
         raise HTTPException(422, f"No template configured for event {request.event}")
+    application = session.get(Application, request.application_id)
+    if not application:
+        # Backward compatible default: existing applications can use email, but must opt in to SMS.
+        application = Application(id=request.application_id, email_enabled=True, sms_enabled=False)
+        session.add(application)
+        session.flush()
     requested_recipients = request.recipients or [request.recipient]
     resolved_recipients = [
-        (recipient, resolve_email(session, recipient.type, recipient.value))
+        (recipient, *resolve_destination(session, recipient.type, recipient.value))
         for recipient in requested_recipients
     ]
+    for _, channel, _ in resolved_recipients:
+        if channel == "EMAIL" and not application.email_enabled:
+            raise HTTPException(422, f"Email is disabled for application {request.application_id}")
+        if channel == "SMS" and not application.sms_enabled:
+            raise HTTPException(422, f"SMS is disabled for application {request.application_id}")
+        if channel == "SMS" and not settings.sms_enabled:
+            raise HTTPException(503, "SMS delivery is disabled on this notification platform")
     notification = Notification(
         application_id=request.application_id, event=request.event,
         idempotency_key=request.idempotency_key,
@@ -71,8 +89,8 @@ def create_notification(request: NotificationRequest, session: Session = Depends
     session.add(notification)
     session.flush()
     # One independent delivery per recipient permits private emails and per-address retry/status.
-    for _, email in resolved_recipients:
-        session.add(Delivery(notification_id=notification.id, destination=email))
+    for _, channel, destination in resolved_recipients:
+        session.add(Delivery(notification_id=notification.id, channel=channel, destination=destination))
     try:
         session.commit()
     except IntegrityError:
@@ -102,9 +120,9 @@ def get_notification(notification_id: str, session: Session = Depends(get_sessio
 def upsert_template(event: str, request: TemplateInput, session: Session = Depends(get_session)):
     template = session.get(Template, event)
     if template:
-        template.subject, template.body, template.html_body = request.subject, request.body, request.html_body
+        template.subject, template.body, template.html_body, template.sms_body = request.subject, request.body, request.html_body, request.sms_body
     else:
-        session.add(Template(event=event, subject=request.subject, body=request.body, html_body=request.html_body))
+        session.add(Template(event=event, subject=request.subject, body=request.body, html_body=request.html_body, sms_body=request.sms_body))
     session.commit()
     return {"event": event, "status": "saved"}
 
@@ -118,3 +136,15 @@ def register_recipient(request: RecipientDirectoryInput, session: Session = Depe
         session.add(Recipient(user_id=request.user_id, email=request.email))
     session.commit()
     return {"user_id": request.user_id, "email": request.email}
+
+
+@app.put("/applications/{application_id}")
+def configure_application(application_id: str, request: ApplicationConfigInput, session: Session = Depends(get_session)):
+    application = session.get(Application, application_id)
+    if application:
+        application.email_enabled = request.email_enabled
+        application.sms_enabled = request.sms_enabled
+    else:
+        session.add(Application(id=application_id, email_enabled=request.email_enabled, sms_enabled=request.sms_enabled))
+    session.commit()
+    return {"application_id": application_id, "email_enabled": request.email_enabled, "sms_enabled": request.sms_enabled}

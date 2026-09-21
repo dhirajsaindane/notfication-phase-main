@@ -54,6 +54,15 @@ class Template(Base):
     subject: Mapped[str] = mapped_column(String(255))
     body: Mapped[str] = mapped_column(Text)
     html_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sms_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class Application(Base):
+    """Per-application delivery permissions. SMS is opt-in by default."""
+    __tablename__ = "applications"
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    email_enabled: Mapped[bool] = mapped_column(default=True)
+    sms_enabled: Mapped[bool] = mapped_column(default=False)
 
 
 class Recipient(Base):

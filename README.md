@@ -9,6 +9,7 @@ A runnable notification service for a first production-style integration. Applic
 - One recipient or a list of up to 100 recipients per notification
 - Central templates stored in PostgreSQL
 - Plain-text and HTML email templates through SMTP (Mailpit is included for local development)
+- Twilio SMS delivery, which is disabled unless explicitly enabled per application
 - Persistent statuses: `PENDING`, `PROCESSING`, `SENT`, `RETRYING`, `DEAD_LETTER`
 - Exponential retry: 30 seconds, then 60 seconds; default maximum 3 attempts
 - Idempotency per application
@@ -149,7 +150,67 @@ Invoke-RestMethod http://localhost:8000/templates/INVOICE_GENERATION_FAILED -Met
 
 See `examples/simple_project_integration.py` for a complete failure-handling pattern. The source project catches its own business exception, submits the notification, logs a notification-system failure separately, and then re-raises the original exception.
 
-If you started the Docker stack before this HTML-template update, reset the local development database once so PostgreSQL receives the new column:
+## Enable and use Twilio SMS
+
+SMS is disabled by default for the platform and for every application. This prevents an application from accidentally incurring SMS charges.
+
+1. Put your Twilio credentials in `.env.docker` when running everything in Docker, or `.env` when running the API and worker locally:
+
+```env
+SMS_ENABLED=true
+SMS_PROVIDER=twilio
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=your-twilio-auth-token
+TWILIO_FROM_NUMBER=+15017122661
+```
+
+Use the Account SID and Auth Token from the Twilio Console, plus the SMS-capable trial or purchased Twilio number. Trial accounts can send only to verified phone numbers. Do not commit these credentials.
+
+### Twilio free-trial template mode
+
+Twilio trial accounts reject custom `sms_body` text. Select a predefined SMS Content Template in the Twilio Console and copy its `HX...` Content SID into the environment file:
+
+```env
+TWILIO_TRIAL_CONTENT_SID=HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+When this variable is set, every SMS uses that Twilio template instead of the local `sms_body`; this is intentional for trial testing. After upgrading the Twilio account, remove this variable to use the notification platform's event-specific `sms_body` templates again.
+
+2. Explicitly enable SMS for an application:
+
+```powershell
+$app = @{ email_enabled = $true; sms_enabled = $true } | ConvertTo-Json
+Invoke-RestMethod http://localhost:8000/applications/payment-service -Method PUT -ContentType 'application/json' -Body $app
+```
+
+3. Add a concise text SMS template for the event:
+
+```powershell
+$template = @{
+  subject = "Payment {{ payment_id }} failed"
+  body = "Payment {{ payment_id }} failed. {{ reason }}"
+  html_body = "<h2>Payment failed</h2><p>Payment <strong>{{ payment_id }}</strong> failed.</p>"
+  sms_body = "Payment {{ payment_id }} failed. {{ reason }}"
+} | ConvertTo-Json
+Invoke-RestMethod http://localhost:8000/templates/PAYMENT_FAILED -Method PUT -ContentType 'application/json' -Body $template
+```
+
+4. Send a notification to a phone number in E.164 format:
+
+```powershell
+$sms = @{
+  application_id = "payment-service"
+  event = "PAYMENT_FAILED"
+  recipient = @{ type = "PHONE"; value = "+919876543210" }
+  data = @{ payment_id = "PAY-100"; reason = "Insufficient balance" }
+  idempotency_key = "payment-PAY-100-failed-sms"
+} | ConvertTo-Json -Depth 4
+Invoke-RestMethod http://localhost:8000/notifications -Method POST -ContentType 'application/json' -Body $sms
+```
+
+The platform creates a separate SMS delivery record. It uses the same persistent retry and dead-letter behavior as email.
+
+If you started the Docker stack before this template/channel update, reset the local development database once so PostgreSQL receives the new tables and columns:
 
 ```powershell
 docker compose down -v
