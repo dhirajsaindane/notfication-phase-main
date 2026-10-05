@@ -13,6 +13,8 @@ A runnable notification service for a first production-style integration. Applic
 - Persistent statuses: `PENDING`, `PROCESSING`, `SENT`, `RETRYING`, `DEAD_LETTER`
 - Exponential retry: 30 seconds, then 60 seconds; default maximum 3 attempts
 - Idempotency per application
+- Alembic migrations and safe adoption of existing PostgreSQL volumes
+- Worker crash recovery for deliveries stuck in `PROCESSING`
 
 ## Folder structure
 
@@ -40,6 +42,14 @@ Prerequisites: Docker Desktop running.
 
 ```powershell
 docker compose up --build
+```
+
+The `migrate` service runs before the API and worker. It creates a new schema or safely adopts the known legacy schema in an existing Docker volume without deleting notification history.
+
+New installations include responsive `REPORT_READY`, `PAYMENT_FAILED`, and `SYSTEM_ALERT` HTML templates. To intentionally replace existing templates with these polished designs, first review `service/app/default_templates.py`, then run:
+
+```powershell
+python examples/install_polished_templates.py --replace
 ```
 
 In another terminal, send the example:
@@ -219,6 +229,8 @@ docker compose up --build
 
 Use proper database migrations (for example Alembic) instead of this reset for any environment containing real notification history.
 
+This project now uses Alembic migrations automatically. Never use `docker compose down -v` in production: it removes the PostgreSQL volume and all notification history. Before production upgrades, take a PostgreSQL backup and run the `migrate` service as part of the deployment.
+
 ## Add the SDK to an application
 
 Deploy this service once (for example at `https://notifications.company.internal`). Each product then installs only the SDK and points it to that shared URL.
@@ -264,5 +276,15 @@ Each project needs a unique `application_id`, for example `payment-service` or `
 | `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS` | Production SMTP credentials/security |
 | `MAX_DELIVERY_ATTEMPTS` | Attempts before `DEAD_LETTER` |
 | `WORKER_POLL_SECONDS` | Queue polling interval |
+| `PROCESSING_TIMEOUT_SECONDS` | Reclaim a delivery left in `PROCESSING` after a worker crash; default 300 seconds |
+| `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS` | PostgreSQL connection-pool limits |
 
 For production, replace Mailpit settings with your provider and inject secrets through a secret manager; do not commit `.env`. Phase 2 should replace the local `recipients` table with a shared Identity/Directory API and add Kafka plus other delivery channels.
+
+## Production readiness notes
+
+- Keep `.env.docker` and `.env.local` outside source control. Use a secrets manager for SMTP and Twilio credentials.
+- Do not expose PostgreSQL port `5432` publicly. It is published in this Compose file for local development only.
+- Add API-key or OAuth authorization before letting other projects use `/notifications`, `/templates`, `/applications`, or `/recipients`.
+- A recovered `PROCESSING` delivery may be sent twice if a worker crashes after the provider accepts the message but before the database is updated. Use provider-side idempotency or a provider message reference for strict delivery guarantees.
+- `SENT` means the provider accepted the delivery request. Provider delivery callbacks are needed to record carrier-confirmed SMS delivery.

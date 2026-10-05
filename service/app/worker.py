@@ -5,16 +5,21 @@ from datetime import timedelta
 from email.message import EmailMessage
 
 import httpx
-from jinja2 import Environment, StrictUndefined
-from sqlalchemy import select
+from jinja2 import Environment, StrictUndefined, UndefinedError
+from sqlalchemy import select, update
 
 from .config import settings
-from .database import Base, SessionLocal, engine
+from .database import SessionLocal
 from .models import Delivery, DeliveryStatus, Notification, Template, utcnow
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
-templates = Environment(undefined=StrictUndefined, autoescape=False)
+text_templates = Environment(undefined=StrictUndefined, autoescape=False)
+html_templates = Environment(undefined=StrictUndefined, autoescape=True)
+
+
+class PermanentDeliveryError(RuntimeError):
+    """An error that will not become successful if the worker retries it."""
 
 
 def send_email(destination: str, subject: str, body: str, html_body: str | None = None) -> None:
@@ -36,11 +41,11 @@ def send_email(destination: str, subject: str, body: str, html_body: str | None 
 def send_sms(destination: str, body: str) -> None:
     """Submit one SMS to Twilio's Programmable Messaging REST API."""
     if not settings.sms_enabled:
-        raise RuntimeError("SMS delivery is disabled")
+        raise PermanentDeliveryError("SMS delivery is disabled")
     if settings.sms_provider != "twilio":
-        raise RuntimeError(f"Unsupported SMS provider: {settings.sms_provider}")
+        raise PermanentDeliveryError(f"Unsupported SMS provider: {settings.sms_provider}")
     if not all([settings.twilio_account_sid, settings.twilio_auth_token, settings.twilio_from_number]):
-        raise RuntimeError("Twilio credentials or TWILIO_FROM_NUMBER are not configured")
+        raise PermanentDeliveryError("Twilio credentials or TWILIO_FROM_NUMBER are not configured")
 
     url = f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Messages.json"
     request_data = {"From": settings.twilio_from_number, "To": destination}
@@ -66,11 +71,30 @@ def send_sms(destination: str, body: str) -> None:
             message = detail.get("message", response.text) if isinstance(detail, dict) else response.text
         except ValueError:
             code, message = "unknown", response.text
-        raise RuntimeError(f"Twilio rejected SMS: HTTP {response.status_code}, code {code}: {message}")
+        error = f"Twilio rejected SMS: HTTP {response.status_code}, code {code}: {message}"
+        if response.status_code != 429 and response.status_code < 500:
+            raise PermanentDeliveryError(error)
+        raise RuntimeError(error)
+
+
+def recover_stale_deliveries(session) -> None:
+    cutoff = utcnow() - timedelta(seconds=settings.processing_timeout_seconds)
+    session.execute(
+        update(Delivery)
+        .where(Delivery.status == DeliveryStatus.PROCESSING, Delivery.claimed_at < cutoff)
+        .values(
+            status=DeliveryStatus.RETRYING,
+            next_attempt_at=utcnow(),
+            claimed_at=None,
+            last_error="Recovered after a worker restart or processing timeout.",
+        )
+    )
+    session.commit()
 
 
 def process_one() -> bool:
     with SessionLocal() as session:
+        recover_stale_deliveries(session)
         delivery = session.scalar(
             select(Delivery)
             .where(Delivery.status.in_([DeliveryStatus.PENDING, DeliveryStatus.RETRYING]), Delivery.next_attempt_at <= utcnow())
@@ -81,30 +105,33 @@ def process_one() -> bool:
         if not delivery:
             return False
         delivery.status = DeliveryStatus.PROCESSING
+        delivery.claimed_at = utcnow()
+        delivery.attempt_count += 1
         session.commit()
         notification = session.get(Notification, delivery.notification_id)
         template = session.get(Template, notification.event)
         try:
             if delivery.channel == "EMAIL":
-                subject = templates.from_string(template.subject).render(**notification.payload)
-                body = templates.from_string(template.body).render(**notification.payload)
-                html_body = templates.from_string(template.html_body).render(**notification.payload) if template.html_body else None
+                subject = text_templates.from_string(template.subject).render(**notification.payload)
+                body = text_templates.from_string(template.body).render(**notification.payload)
+                html_body = html_templates.from_string(template.html_body).render(**notification.payload) if template.html_body else None
                 send_email(delivery.destination, subject, body, html_body)
             elif delivery.channel == "SMS":
                 if not template.sms_body:
-                    raise RuntimeError(f"No SMS template configured for event {notification.event}")
-                sms_body = templates.from_string(template.sms_body).render(**notification.payload)
+                    raise PermanentDeliveryError(f"No SMS template configured for event {notification.event}")
+                sms_body = text_templates.from_string(template.sms_body).render(**notification.payload)
                 send_sms(delivery.destination, sms_body)
             else:
-                raise RuntimeError(f"Unsupported delivery channel: {delivery.channel}")
+                raise PermanentDeliveryError(f"Unsupported delivery channel: {delivery.channel}")
             delivery.status = DeliveryStatus.SENT
             delivery.sent_at = utcnow()
             delivery.last_error = None
+            delivery.claimed_at = None
             log.info("sent delivery=%s destination=%s", delivery.id, delivery.destination)
-        except Exception as exc:  # Delivery must be retried; preserve the provider/template failure.
-            delivery.attempt_count += 1
+        except Exception as exc:  # Preserve a provider/template failure for operational diagnosis.
             delivery.last_error = str(exc)[:4000]
-            if delivery.attempt_count >= settings.max_delivery_attempts:
+            delivery.claimed_at = None
+            if isinstance(exc, (PermanentDeliveryError, UndefinedError)) or delivery.attempt_count >= settings.max_delivery_attempts:
                 delivery.status = DeliveryStatus.DEAD_LETTER
                 log.exception("dead-lettered delivery=%s", delivery.id)
             else:
@@ -117,7 +144,6 @@ def process_one() -> bool:
 
 
 def main():
-    Base.metadata.create_all(bind=engine)
     log.info("notification worker started")
     while True:
         if not process_one():

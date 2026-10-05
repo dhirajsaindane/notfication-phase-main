@@ -1,29 +1,28 @@
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, status
-from sqlalchemy import select
+from jinja2 import Environment, TemplateSyntaxError
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .database import Base, engine, get_session
+from .database import SessionLocal, get_session
+from .default_templates import DEFAULT_TEMPLATES
 from .models import Application, Delivery, Notification, Recipient, Template
 from .schemas import (NotificationRequest, NotificationResponse, NotificationStatusResponse,
                       ApplicationConfigInput, RecipientDirectoryInput, TemplateInput)
 
-DEFAULT_TEMPLATES = {
-    "REPORT_READY": ("Your report {{ report_name }} is ready", "Hello,\n\nYour report '{{ report_name }}' is ready.", "<h1>Report ready</h1><p>Your report <strong>{{ report_name }}</strong> is ready.</p>", "Report {{ report_name }} is ready."),
-    "PAYMENT_FAILED": ("Payment {{ payment_id }} failed", "Hello,\n\nPayment {{ payment_id }} for {{ amount }} could not be processed.", "<h1>Payment failed</h1><p>Payment <strong>{{ payment_id }}</strong> for <strong>{{ amount }}</strong> could not be processed.</p>", "Payment {{ payment_id }} for {{ amount }} failed. {{ reason }}"),
-}
+template_parser = Environment()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    with Session(engine) as session:
-        for event, (subject, body, html_body, sms_body) in DEFAULT_TEMPLATES.items():
+    # Schema changes are applied by Alembic before this process starts.
+    with SessionLocal() as session:
+        for event, content in DEFAULT_TEMPLATES.items():
             if session.get(Template, event) is None:
-                session.add(Template(event=event, subject=subject, body=body, html_body=html_body, sms_body=sms_body))
+                session.add(Template(event=event, **content))
         session.commit()
     yield
 
@@ -46,7 +45,12 @@ def resolve_destination(session: Session, recipient_type: str, recipient_value: 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    try:
+        with SessionLocal() as session:
+            session.execute(text("SELECT 1"))
+        return {"status": "ok", "database": "ok"}
+    except Exception as exc:
+        raise HTTPException(503, "Database is unavailable") from exc
 
 
 @app.post("/notifications", response_model=NotificationResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -78,20 +82,17 @@ def create_notification(request: NotificationRequest, session: Session = Depends
             raise HTTPException(422, f"SMS is disabled for application {request.application_id}")
         if channel == "SMS" and not settings.sms_enabled:
             raise HTTPException(503, "SMS delivery is disabled on this notification platform")
-    notification = Notification(
-        application_id=request.application_id, event=request.event,
-        idempotency_key=request.idempotency_key,
-        # The first recipient is retained for concise event-level reporting.
-        # Individual destinations are always stored on Delivery records.
-        recipient_type=resolved_recipients[0][0].type, recipient_value=resolved_recipients[0][0].value,
-        payload=request.data,
-    )
-    session.add(notification)
-    session.flush()
-    # One independent delivery per recipient permits private emails and per-address retry/status.
-    for _, channel, destination in resolved_recipients:
-        session.add(Delivery(notification_id=notification.id, channel=channel, destination=destination))
     try:
+        notification = Notification(
+            application_id=request.application_id, event=request.event,
+            idempotency_key=request.idempotency_key,
+            recipient_type=resolved_recipients[0][0].type, recipient_value=resolved_recipients[0][0].value,
+            payload=request.data,
+        )
+        session.add(notification)
+        session.flush()
+        for _, channel, destination in resolved_recipients:
+            session.add(Delivery(notification_id=notification.id, channel=channel, destination=destination))
         session.commit()
     except IntegrityError:
         session.rollback()
@@ -118,6 +119,12 @@ def get_notification(notification_id: str, session: Session = Depends(get_sessio
 
 @app.put("/templates/{event}")
 def upsert_template(event: str, request: TemplateInput, session: Session = Depends(get_session)):
+    try:
+        for source in (request.subject, request.body, request.html_body, request.sms_body):
+            if source:
+                template_parser.parse(source)
+    except TemplateSyntaxError as exc:
+        raise HTTPException(422, f"Invalid template syntax: {exc.message}") from exc
     template = session.get(Template, event)
     if template:
         template.subject, template.body, template.html_body, template.sms_body = request.subject, request.body, request.html_body, request.sms_body
